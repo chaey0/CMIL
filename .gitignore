@@ -1,0 +1,47 @@
+# Output directories
+outputs/
+outputs_0517/
+outputs_15epoch/
+outputs_text_refinement/
+visualization_out/
+anchor_analysis_taxonomy/
+anchor_analysis_taxonomy_old/
+anchor_analysis_taxonomy_old_titan/
+
+# Data directories
+data/
+REG2025_cleaned/
+REG_prep/
+TCGA_prep/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and temp files
+*.log
+*.tmp
+*.csv
+*.h5
+*.pt
+*.pth
+*.pkl
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# Local Claude settings
+.claude/
+
+# IDE
+.vscode/
+.idea/

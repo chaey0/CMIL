@@ -1,0 +1,172 @@
+model:
+  embed_dim: 768
+  mil_hidden_dim: 512
+  mil_dropout: 0.25
+
+  use_mil_lora: true
+  mil_lora_r: 8
+  mil_lora_alpha: 16
+  mil_lora_dropout: 0.05
+
+  organ_task_adaptor_mode: "merge"
+  organ_task_adaptor_merge: "sum"
+
+text_refine:
+  steps: 300
+  lr: 0.01
+
+  sib_cos_upper: 0.5        # Euclidean: max cosine sim between siblings (upper bound)
+ 
+  sib_hyp_margin: 0.8       # Hyperbolic: min d_H between siblings (lower bound)
+  parent_margin: 1.5        # Hyperbolic: hinge threshold for parent attraction
+
+  new_delta_scale: 1.0
+  old_delta_scale: 0.0
+
+  lambda_sib: 1.0
+  lambda_par: 0.3
+  lambda_dir: 0.05          # KEEP direction preservation
+  lambda_delta: 0.01        # delta L2 penalty
+
+  lambda_cross: 1.0         # cross-coarse hard-negative loss (0 = off)
+  cross_cos_upper: 0.2      # max cosine sim allowed between new fine and other-coarse fine
+  cross_topk: 3             # hard negatives per new fine label
+
+  print_every: 50
+
+# Hyperbolic: enabled/mode는 main.py CLI로 override 가능
+#   --hyp / --no_hyp      (enabled)
+#   --hyp_geometry        (geometry)
+# Default: disabled (Euclidean baseline)
+hyperbolic:
+  enabled: false
+  mode: "aux"              # aux: linear cls + hyp alignment | full: hyp prototype cls
+  geometry: "poincare"
+  curvature: 5.0
+  tau: 0.1
+  squared_distance: true
+
+  max_tangent_norm: 1.0
+  coarse_tangent_scale: 0.3   # 원점 근처 (organ)
+  task_tangent_scale: 0.6     # 중간 (task type)
+  fine_tangent_scale: 1.0     # 바깥 (fine label)
+
+  sib_hyp_margin: 1.0
+
+eval:
+  scope: "global"
+  primary_scope: "global"
+
+train:
+  scheduler: "cosine"
+  batch_size: 32
+
+  epochs_per_session: 15
+  epochs_joint: 150
+  warmup_epochs: 0
+
+  lr: 0.0001
+  weight_decay: 0.00001
+
+  full_tune_base_session: true
+  train_shared_mil_after_base: false
+  train_projector_in_warmup: true
+
+  lambda_cls_task: 1.0
+  lambda_cls_global: 1.0
+
+  lambda_align: 1.0
+  align_temperature: 0.07
+
+  lambda_sib: 1.0
+  sib_cos_margin: 0.1
+
+  lambda_replay: 1.0
+  lambda_replay_cls: 1.0
+  lambda_replay_align: 1.0
+  replay_num_per_class: 32
+
+  lambda_weight_anchor: 0.01
+
+  # DER++ replay buffer (WSI 단위, patch tensor 메모리 저장)
+  # 주의: 로컬 코드에서 alpha=CE replay, beta=MSE dark (논문/ConSlide와 반대)
+  derpp_buffer_size: 100
+  derpp_replay_batch_size: 30
+  derpp_alpha: 0.5   # CE replay weight  
+  derpp_beta: 0.5    # MSE dark weight  
+
+  # Hyperbolic hierarchy alignment (image → coarse/task ancestor)
+  lambda_hierarchy: 0.3
+
+  # OrganTask adaptor orthogonality — CLI: --lambda_orth <value>
+  lambda_orth: 0.0
+
+sessions:
+  # ── TCGA continual sessions ──────────────────────────────────────────────
+  - name: "brain"
+    organ: "BRAIN"
+    task: "brain_glioma_subtype"
+    fine_labels: ["GBM", "LGG"]
+    datasets: ["TCGA"]
+
+  - name: "lung"
+    organ: "LUNG"
+    task: "lung_nsclc_subtype"
+    fine_labels: ["LUAD", "LUSC"]
+    datasets: ["TCGA"]
+
+  - name: "breast"
+    organ: "BREAST"
+    task: "breast_brca_subtype"
+    fine_labels: ["IDC", "ILC"]
+    datasets: ["TCGA"]
+
+  - name: "kidney"
+    organ: "KIDNEY"
+    task: "kidney_rcc_subtype"
+    fine_labels: ["CCRCC", "PRCC", "CHRCC"]
+    datasets: ["TCGA"]
+
+  - name: "uterus"
+    organ: "UTERUS"
+    task: "uterus_corpus_subtype"
+    fine_labels: ["UCEC", "UCS"]
+    datasets: ["TCGA"]
+
+  - name: "prostate"
+    organ: "PROSTATE"
+    task: "prostate_isup_grade"
+    fine_labels: ["ISUP1", "ISUP2", "ISUP3", "ISUP4", "ISUP5"]
+    datasets: ["TCGA"]
+
+  - name: "testis"
+    organ: "TESTIS"
+    task: "testis_tgct_subtype"
+    fine_labels: ["SEM", "NSGCT"]
+    datasets: ["TCGA"]
+
+  - name: "esophagus"
+    organ: "ESOPHAGUS"
+    task: "esophagus_histology"
+    fine_labels: ["ESCC", "ESCA_ADENO"]
+    datasets: ["TCGA"]
+
+  - name: "cervix"
+    organ: "CERVIX"
+    task: "cervix_histology"
+    fine_labels: ["CESC_SCC", "CESC_ADENO"]
+    datasets: ["TCGA"]
+
+  # ── PANDA session ────────────────────────────────────────────────────────
+  - name: "prostate_panda"
+    organ: "PROSTATE"
+    task: "prostate_isup_grade"
+    fine_labels: ["PROSTATE_NORMAL", "ISUP1", "ISUP2", "ISUP3", "ISUP4", "ISUP5"]
+    datasets: ["PANDA"]
+
+  # ── BRACS session (3-class coarse: Benign / Atypical / Malignant) ──────
+  - name: "breast_bracs"
+    organ: "BREAST"
+    task: "breast_bracs_coarse"
+    fine_labels: ["BREAST_BENIGN", "BREAST_ATYPIA", "BREAST_MALIGNANT"]
+    datasets: ["BRACS"]
