@@ -288,6 +288,9 @@ def build_cumulative_result_row(session_idx, session_name, ckpt_path, metrics_by
                 "per_task_count": m.get("per_task_count", {}),
                 "opened_tasks": m.get("opened_tasks", []),
             })
+        if m.get("per_dataset_acc"):
+            row["per_dataset_acc"] = m["per_dataset_acc"]
+            row["per_dataset_count"] = m["per_dataset_count"]
     return row
 
 
@@ -557,7 +560,6 @@ def _apply_cli_overrides(cfg: dict, args) -> dict:
         f"lambda_orth={train.get('lambda_orth', 0.0)}"
     )
     return cfg
-
 
 # -----------------------------------------------------------------------------
 # main
