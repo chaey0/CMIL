@@ -467,6 +467,7 @@ def build_input_specs(args):
 # Plot
 # -----------------------------------------------------------------------------
 def plot_curves(
+    args,
     curves,
     save_path=None,
     title=None,
@@ -519,10 +520,99 @@ def plot_curves(
 
         if save_path.suffix == "":
             save_path.mkdir(parents=True, exist_ok=True)
-            save_path = save_path / "subtype_acc_scope_comparison.png"
+            save_path = save_path / f"subtype_{args.metric}_scope_comparison.png"
         else:
             save_path.parent.mkdir(parents=True, exist_ok=True)
 
+        fig.savefig(save_path, dpi=220, bbox_inches="tight")
+        print(f"[Saved] {save_path}")
+    else:
+        plt.show()
+
+
+# -----------------------------------------------------------------------------
+# Dataset breakdown plot
+# -----------------------------------------------------------------------------
+def load_dataset_accs_from_json(json_path: str, metric: str = "acc"):
+    """Load per_dataset_acc from each step in a metrics JSON."""
+    path = Path(json_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    items = _get_session_items_from_json_root(data, json_path)
+
+    records = []
+    for i, item in enumerate(items):
+        sess_idx = int(_get_first_existing(item, ["session_idx", "idx", "session"], i))
+        sess_name = str(_get_first_existing(item, ["session_name", "name"], f"session_{sess_idx}"))
+        per_ds = item.get("per_dataset_acc", {})
+        records.append((sess_idx, sess_name, per_ds))
+
+    return records
+
+
+def plot_dataset_curves(
+    method_records,
+    save_path=None,
+    title=None,
+    ylim_min=0.0,
+    ylim_max=100.0,
+    show_values=False,
+):
+    """
+    method_records: list of (method_label, records)
+      records: list of (sess_idx, sess_name, {dataset: acc})
+    """
+    # Collect all dataset names across all methods/sessions
+    all_datasets = sorted({
+        ds
+        for _, records in method_records
+        for _, _, per_ds in records
+        for ds in per_ds
+    })
+
+    n_datasets = len(all_datasets)
+    if n_datasets == 0:
+        print("[Warning] No per_dataset_acc found in JSON. Run with return_details=True first.")
+        return
+
+    fig, axes = plt.subplots(1, n_datasets, figsize=(5.5 * n_datasets, 5.2), sharey=True)
+    if n_datasets == 1:
+        axes = [axes]
+
+    for ax, ds_name in zip(axes, all_datasets):
+        for method_label, records in method_records:
+            sessions = [r[0] for r in records if ds_name in r[2]]
+            accs = [_to_percent(r[2][ds_name]) for r in records if ds_name in r[2]]
+            if not sessions:
+                continue
+            ax.plot(sessions, accs, marker="o", linewidth=2, label=method_label)
+            if show_values:
+                for s, a in zip(sessions, accs):
+                    ax.annotate(f"{a:.1f}", xy=(s, a), xytext=(0, 6),
+                                textcoords="offset points", ha="center", fontsize=8)
+
+        names = [r[1] for r in (method_records[0][1] if method_records else [])]
+        sessions_ref = [r[0] for r in (method_records[0][1] if method_records else [])]
+        if sessions_ref:
+            ax.set_xticks(sessions_ref)
+            ax.set_xticklabels([f"S{s}" for s in sessions_ref], fontsize=8)
+
+        ax.set_title(ds_name, fontsize=11)
+        ax.set_xlabel("Session")
+        ax.set_ylim(float(ylim_min), float(ylim_max))
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    axes[0].set_ylabel("Accuracy (%)")
+    fig.suptitle(title or "Per-Dataset Session-wise Accuracy", fontsize=13)
+    fig.tight_layout()
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        if save_path.suffix == "":
+            save_path.mkdir(parents=True, exist_ok=True)
+            save_path = save_path / "per_dataset_acc.png"
+        else:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=220, bbox_inches="tight")
         print(f"[Saved] {save_path}")
     else:
@@ -544,6 +634,9 @@ def main():
     parser.add_argument("--cil", type=str, default=None, help="Path to CIL metrics JSON or CIL log")
     parser.add_argument("--joint", type=str, default=None, help="Path to JOINT metrics JSON or JOINT log")
     parser.add_argument("--finetune", type=str, default=None, help="Path to FINETUNE metrics JSON or FINETUNE log")
+    parser.add_argument("--plot_type", type=str, default="session",
+                        choices=["session", "dataset"],
+                        help="session: session-wise accuracy curve | dataset: per-dataset breakdown")
 
     # Additional arbitrary methods, e.g. DER++, LwF, EWC, BiC, etc.
     # The number/order of --methods and --method_jsons must match.
@@ -579,7 +672,7 @@ def main():
         ),
     )
 
-    parser.add_argument("--metric", type=str, default="acc",
+    parser.add_argument("--metric", type=str, default="wf1",
                         choices=["acc", "bacc", "wf1"],
                         help="Metric to plot: acc | bacc | wf1 (default: acc)")
     parser.add_argument("--save_path", type=str, default="./plots")
@@ -597,9 +690,31 @@ def main():
             "or additional methods with --methods DER++ LwF --method_jsons derpp.json lwf.json."
         )
 
-    curves = []
-
     metric = args.metric
+
+    # ── Dataset breakdown plot ───────────────────────────────────────────────
+    if args.plot_type == "dataset":
+        method_records = []
+        for method_label, path, mode in inputs:
+            if not path.endswith(".json"):
+                print(f"[Skip] {method_label}: --plot_type dataset requires JSON output.")
+                continue
+            records = load_dataset_accs_from_json(path, metric=metric)
+            method_records.append((method_label, records))
+        if not method_records:
+            raise ValueError("No dataset breakdown data found. Ensure JSON output exists.")
+        plot_dataset_curves(
+            method_records,
+            save_path=args.save_path,
+            title=args.title,
+            ylim_min=args.ylim_min,
+            ylim_max=args.ylim_max,
+            show_values=args.show_values,
+        )
+        return
+
+    # ── Session-wise accuracy curve (default) ────────────────────────────────
+    curves = []
 
     for method_label, path, mode in inputs:
 
@@ -646,6 +761,7 @@ def main():
             title = f"Session-wise Subtyping {m_str}"
 
     plot_curves(
+        args=args,
         curves=curves,
         save_path=args.save_path,
         title=title,

@@ -170,7 +170,6 @@ def _mean(xs):
 def _fmt_pct(x):
     return "N/A" if x is None else f"{x:.2f}%"
 
-
 def _fmt_score(x):
     return "N/A" if x is None else f"{x:.4f}"
 
@@ -189,6 +188,24 @@ def compute_metrics_from_details(details):
 def _task_key(organ, task):
     task = str(task)
     return str(organ) if task in {"", "None", "none", "null", "default"} else f"{organ}/{task}"
+
+
+def compute_dataset_breakdown_from_details(details):
+    y_true = details["fine_true"].detach().cpu()
+    y_pred = details["fine_pred"].detach().cpu()
+    datasets = details.get("context_datasets", [])
+    if not datasets or len(datasets) != len(y_true):
+        return {}
+
+    correct, count = {}, {}
+    for i, ds in enumerate(datasets):
+        correct[ds] = correct.get(ds, 0) + int(y_true[i].item() == y_pred[i].item())
+        count[ds] = count.get(ds, 0) + 1
+
+    return {
+        "per_dataset_acc": {ds: 100.0 * correct[ds] / count[ds] for ds in sorted(count)},
+        "per_dataset_count": {ds: count[ds] for ds in sorted(count)},
+    }
 
 
 def compute_task_breakdown_from_details(details):
@@ -242,6 +259,7 @@ def evaluate_cumulative_open_set(
     })
     if eval_scope == "task":
         metrics.update(compute_task_breakdown_from_details(details))
+    metrics.update(compute_dataset_breakdown_from_details(details))
     if return_details:
         metrics["details"] = details
         metrics["opened_fine_labels"] = list(info["opened_fine"])
@@ -351,6 +369,8 @@ def build_payload(results, summary, mode, scope):
             step["per_task_acc"] = r.get("per_task_acc", {})
             step["per_task_count"] = r.get("per_task_count", {})
             step["opened_tasks"] = r.get("opened_tasks", [])
+        step["per_dataset_acc"] = r.get("per_dataset_acc", {})
+        step["per_dataset_count"] = r.get("per_dataset_count", {})
         steps.append(step)
     return {
         "mode": mode,

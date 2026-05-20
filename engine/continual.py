@@ -986,7 +986,7 @@ def evaluate(model, loader, device, fine_mask=None, coarse_mask=None, return_det
     if scope not in {"task", "global"}:
         raise ValueError(f"Unknown eval_scope: {eval_scope}")
 
-    true_all, pred_all, organs_all, tasks_all = [], [], [], []
+    true_all, pred_all, organs_all, tasks_all, datasets_all = [], [], [], [], []
     opened_task_keys = model.get_opened_task_keys()
 
     for batch in tqdm(loader, total=len(loader), desc=f"Evaluate[{scope}]", leave=False):
@@ -994,6 +994,7 @@ def evaluate(model, loader, device, fine_mask=None, coarse_mask=None, return_det
         fine_global = batch["fine_ids"].to(device)
         fine_local = model.global_fine_to_local(fine_global)
         task_keys, organs, tasks = infer_task_keys(model, batch, fine_global)
+        datasets = batch.get("datasets", ["unknown"] * len(feats))
 
         z_shared, _ = model.encode_shared(feats)
         out_global = _forward_global_from_z(model, z_shared, opened_task_keys, cfg)
@@ -1008,6 +1009,7 @@ def evaluate(model, loader, device, fine_mask=None, coarse_mask=None, return_det
         pred_all.append(pred.cpu())
         organs_all.extend(organs)
         tasks_all.extend(tasks)
+        datasets_all.extend(datasets)
 
     y_true = torch.cat(true_all).long() if true_all else torch.empty(0, dtype=torch.long)
     y_pred = torch.cat(pred_all).long() if pred_all else torch.empty(0, dtype=torch.long)
@@ -1023,6 +1025,7 @@ def evaluate(model, loader, device, fine_mask=None, coarse_mask=None, return_det
         "fine_labels": list(model.active_fine_labels),
         "context_organs": organs_all,
         "context_tasks": tasks_all,
+        "context_datasets": datasets_all,
     }
 
 
