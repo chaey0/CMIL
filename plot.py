@@ -135,55 +135,31 @@ def _get_session_items_from_json_root(data, json_path):
     )
 
 
-def _extract_json_acc_for_scope(item, requested_scope, fallback_scope=None):
+def _extract_json_metric_for_scope(item, requested_scope, metric="acc"):
     """
+    Extract a metric value (acc / bacc / wf1) for the given scope.
+
     Supported item formats:
-
-    1) scoped flat keys:
-       {
-         "subtype_acc_global": 87.1,
-         "subtype_acc_task": 88.0
-       }
-
-    2) scoped nested keys:
-       {
-         "subtype_global": {"acc": 87.1},
-         "subtype_task": {"acc": 88.0}
-       }
-
-    3) standard cumulative format:
-       {
-         "eval_scope": "global",
-         "subtype": {"acc": 87.1}
-       }
-
-    4) older/plain format:
-       {
-         "subtype_acc": 87.1
-       }
+      1) flat scoped:  {"subtype_acc_global": 87.1, "subtype_bacc_global": 85.0}
+      2) nested block: {"subtype_global": {"acc": 87.1, "bacc": 85.0}}
+      3) cumulative:   {"eval_scope": "global", "subtype": {"acc": 87.1}}
+      4) plain:        {"subtype_acc": 87.1}
     """
     requested_scope = _normalize_scope(requested_scope)
+    m = str(metric).lower()  # acc | bacc | wf1
 
     if requested_scope in {"global", "task"}:
-        scoped_flat_keys = [
-            f"subtype_acc_{requested_scope}",
-            f"fine_acc_{requested_scope}",
-            f"acc_{requested_scope}",
-        ]
-
-        for key in scoped_flat_keys:
+        # flat keys: subtype_acc_global, subtype_bacc_global, subtype_wf1_global
+        for prefix in ["subtype", "fine"]:
+            key = f"{prefix}_{m}_{requested_scope}"
             if key in item:
                 return _to_percent(item[key])
 
-        scoped_block_keys = [
-            f"subtype_{requested_scope}",
-            f"fine_{requested_scope}",
-        ]
-
-        for key in scoped_block_keys:
-            block = item.get(key)
-            if isinstance(block, dict) and "acc" in block:
-                return _to_percent(block["acc"])
+        # nested block: subtype_global.{acc|bacc|wf1}
+        for block_key in [f"subtype_{requested_scope}", f"fine_{requested_scope}"]:
+            block = item.get(block_key)
+            if isinstance(block, dict) and m in block:
+                return _to_percent(block[m])
 
     item_scope = item.get("eval_scope", item.get("scope", None))
     if item_scope is not None:
@@ -192,17 +168,24 @@ def _extract_json_acc_for_scope(item, requested_scope, fallback_scope=None):
             return None
 
     subtype_block = item.get("subtype")
-    if isinstance(subtype_block, dict) and "acc" in subtype_block:
-        return _to_percent(subtype_block["acc"])
+    if isinstance(subtype_block, dict) and m in subtype_block:
+        return _to_percent(subtype_block[m])
 
-    for key in ["subtype_acc", "fine_acc", "acc"]:
-        if key in item:
-            return _to_percent(item[key])
+    # plain fallback (acc only)
+    if m == "acc":
+        for key in ["subtype_acc", "fine_acc", "acc"]:
+            if key in item:
+                return _to_percent(item[key])
 
     return None
 
 
-def load_session_accs_by_scope_from_json(json_path: str):
+# keep old name as alias for backward compat
+def _extract_json_acc_for_scope(item, requested_scope, fallback_scope=None):
+    return _extract_json_metric_for_scope(item, requested_scope, metric="acc")
+
+
+def load_session_accs_by_scope_from_json(json_path: str, metric: str = "acc"):
     path = Path(json_path)
     data = json.loads(path.read_text(encoding="utf-8"))
     items = _get_session_items_from_json_root(data, json_path)
@@ -214,27 +197,25 @@ def load_session_accs_by_scope_from_json(json_path: str):
         sess_idx = int(_get_first_existing(item, ["session_idx", "idx", "session"], i))
         sess_name = str(_get_first_existing(item, ["session_name", "name"], f"session_{sess_idx}"))
 
-        # First, try explicitly scoped fields.
         for scope in ["global", "task"]:
-            acc = _extract_json_acc_for_scope(item, scope)
-            if acc is not None:
-                _append_scope_item(store, scope, sess_idx, sess_name, acc)
+            val = _extract_json_metric_for_scope(item, scope, metric=metric)
+            if val is not None:
+                _append_scope_item(store, scope, sess_idx, sess_name, val)
 
-        # If no scoped field exists, assign plain subtype acc to inferred scope.
         has_any = any(
             len(store[scope]["sessions"]) > 0 and store[scope]["sessions"][-1] == sess_idx
             for scope in ["global", "task"]
         )
 
         if not has_any:
-            acc = _extract_json_acc_for_scope(item, inferred_scope or "global")
-            if acc is not None:
-                _append_scope_item(store, inferred_scope or "global", sess_idx, sess_name, acc)
+            val = _extract_json_metric_for_scope(item, inferred_scope or "global", metric=metric)
+            if val is not None:
+                _append_scope_item(store, inferred_scope or "global", sess_idx, sess_name, val)
 
     out = _finalize_scope_store(store)
 
     if not out:
-        raise ValueError(f"No session accuracy data found in JSON: {json_path}")
+        raise ValueError(f"No session '{metric}' data found in JSON: {json_path}")
 
     return out
 
@@ -378,7 +359,7 @@ def parse_session_accs_by_scope_from_log(log_text: str, mode: str = "cil"):
 # -----------------------------------------------------------------------------
 # Unified loader
 # -----------------------------------------------------------------------------
-def load_session_accs_by_scope(path: str, mode: str):
+def load_session_accs_by_scope(path: str, mode: str, metric: str = "acc"):
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -390,7 +371,7 @@ def load_session_accs_by_scope(path: str, mode: str):
         )
 
     if p.suffix.lower() == ".json":
-        return load_session_accs_by_scope_from_json(str(p))
+        return load_session_accs_by_scope_from_json(str(p), metric=metric)
 
     return parse_session_accs_by_scope_from_log(
         p.read_text(encoding="utf-8"),
@@ -494,6 +475,7 @@ def plot_curves(
     show_values=False,
     xlabel="Organ Session",
     ylabel="Subtype Accuracy (%)",
+    metric="acc",
 ):
     fig, ax = plt.subplots(figsize=(9.5, 5.8))
 
@@ -597,6 +579,9 @@ def main():
         ),
     )
 
+    parser.add_argument("--metric", type=str, default="acc",
+                        choices=["acc", "bacc", "wf1"],
+                        help="Metric to plot: acc | bacc | wf1 (default: acc)")
     parser.add_argument("--save_path", type=str, default="./plots")
     parser.add_argument("--title", type=str, default=None)
     parser.add_argument("--ylim_min", type=float, default=0.0)
@@ -614,9 +599,11 @@ def main():
 
     curves = []
 
+    metric = args.metric
+
     for method_label, path, mode in inputs:
 
-        scope_data = load_session_accs_by_scope(path, mode=mode)
+        scope_data = load_session_accs_by_scope(path, mode=mode, metric=metric)
         selected = select_scopes(scope_data, args.scope)
 
         if not selected:
@@ -643,16 +630,20 @@ def main():
         for s, n, a in zip(sessions, names, accs):
             print(f"  Session {s} ({n}): {a:.2f}%")
 
+    _metric_label = {"acc": "Accuracy", "bacc": "Balanced Accuracy", "wf1": "Weighted F1"}
+    _ylabel_map = {"acc": "Subtype Accuracy (%)", "bacc": "Balanced Accuracy (%)", "wf1": "Weighted F1"}
+
     title = args.title
     if title is None:
+        m_str = _metric_label.get(metric, metric.upper())
         if args.scope == "global":
-            title = "Global-open Cumulative Subtyping Accuracy"
+            title = f"Global-open Cumulative Subtyping {m_str}"
         elif args.scope == "task":
-            title = "Task-local Macro Subtyping Accuracy"
+            title = f"Task-local Macro Subtyping {m_str}"
         elif args.scope == "both":
-            title = "Global-open vs Task-local Subtyping Accuracy"
+            title = f"Global-open vs Task-local Subtyping {m_str}"
         else:
-            title = "Session-wise Subtyping Accuracy"
+            title = f"Session-wise Subtyping {m_str}"
 
     plot_curves(
         curves=curves,
@@ -661,6 +652,8 @@ def main():
         ylim_min=args.ylim_min,
         ylim_max=args.ylim_max,
         show_values=args.show_values,
+        ylabel=_ylabel_map.get(metric, metric.upper()),
+        metric=metric,
     )
 
 
