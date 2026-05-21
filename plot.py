@@ -545,7 +545,6 @@ def load_dataset_accs_from_json(json_path: str, metric: str = "acc"):
         sess_name = str(_get_first_existing(item, ["session_name", "name"], f"session_{sess_idx}"))
         per_ds = item.get("per_dataset_acc", {})
         records.append((sess_idx, sess_name, per_ds))
-
     return records
 
 
@@ -713,9 +712,8 @@ def main():
         )
         return
 
-    # ── Session-wise accuracy curve (default) ────────────────────────────────
+    # ── Session-wise accuracy curve (default) ───────────────────────────────
     curves = []
-
     for method_label, path, mode in inputs:
 
         scope_data = load_session_accs_by_scope(path, mode=mode, metric=metric)

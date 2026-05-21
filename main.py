@@ -56,7 +56,7 @@ def load_ckpt_and_get_session_idx(ckpt_path, device):
     return ckpt, ckpt.get("session_idx", None)
 
 
-def make_loader(csv_path, taxonomy, fine_labels, batch_size, shuffle, split=None, split_col="split", dataset_filter=None):
+def make_loader(csv_path, taxonomy, fine_labels, batch_size, shuffle, split=None, split_col="split", dataset_filter=None, num_workers=0, pin_memory=False):
     ds = SlideCSVDataset(
         csv_path=csv_path,
         taxonomy=taxonomy,
@@ -65,7 +65,11 @@ def make_loader(csv_path, taxonomy, fine_labels, batch_size, shuffle, split=None
         split_col=split_col,
         dataset_filter=dataset_filter,
     )
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+    return DataLoader(
+        ds, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+    )
 
 
 def setup_device_from_arg(gpu_arg):
@@ -246,9 +250,11 @@ def evaluate_cumulative_open_set(
     eval_scope="task",
     return_details=False,
     dataset_filter=None,
+    num_workers=0,
+    pin_memory=False,
 ):
     info = setup_session_eval(model, session_manager, session_idx, device, getattr(model, "cfg", {}))
-    loader = make_loader(data_csv, taxonomy, info["opened_fine"], batch_size, False, split=test_split, split_col=split_col, dataset_filter=dataset_filter)
+    loader = make_loader(data_csv, taxonomy, info["opened_fine"], batch_size, False, split=test_split, split_col=split_col, dataset_filter=dataset_filter, num_workers=num_workers, pin_memory=pin_memory)
     _, _, details = evaluate(model, loader, device, return_details=True, eval_scope=eval_scope)
 
     metrics = compute_metrics_from_details(details)
@@ -425,7 +431,7 @@ def build_eval_model_for_session_ckpt(ckpt_path, taxonomy, cfg, session_manager,
     return model, session_idx
 
 
-def evaluate_model_for_scopes(model, session_manager, session_idx, taxonomy, data_csv, batch_size, device, test_split, split_col, eval_scopes, return_details=False, dataset_filter=None):
+def evaluate_model_for_scopes(model, session_manager, session_idx, taxonomy, data_csv, batch_size, device, test_split, split_col, eval_scopes, return_details=False, dataset_filter=None, num_workers=0, pin_memory=False):
     return {
         scope: evaluate_cumulative_open_set(
             model,
@@ -440,6 +446,8 @@ def evaluate_model_for_scopes(model, session_manager, session_idx, taxonomy, dat
             eval_scope=scope,
             return_details=return_details,
             dataset_filter=dataset_filter,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
         for scope in eval_scopes
     }
@@ -457,6 +465,8 @@ def evaluate_joint_model_for_scopes(
     split_col,
     eval_scopes,
     return_details=False,
+    num_workers=0,
+    pin_memory=False,
 ):
     loader = make_loader(
         data_csv,
@@ -466,6 +476,8 @@ def evaluate_joint_model_for_scopes(
         False,
         split=test_split,
         split_col=split_col,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     metrics_by_scope = {}
     for scope in eval_scopes:
@@ -622,6 +634,9 @@ def main():
     session_manager = SessionManager(cfg, taxonomy)
     model = KnowledgeTreeCLModel(taxonomy, cfg).to(device)
     batch_size = cfg["train"].get("batch_size", 16)
+    num_workers = cfg["train"].get("num_workers", 0)
+    pin_memory = cfg["train"].get("pin_memory", False)
+    use_amp = cfg["train"].get("use_amp", False)
     train_split = _none_if_blank(args.train_split)
     test_split = _none_if_blank(args.test_split)
 
@@ -649,7 +664,7 @@ def main():
         for p in model.parameters():
             p.requires_grad = True
 
-        loader = make_loader(args.data_csv, taxonomy, all_fine, batch_size, True, split=train_split, split_col=args.split_col)
+        loader = make_loader(args.data_csv, taxonomy, all_fine, batch_size, True, split=train_split, split_col=args.split_col, num_workers=num_workers, pin_memory=pin_memory)
         optimizer = create_optimizer(model, cfg)
         scheduler = create_scheduler(optimizer, cfg, cfg["train"].get("epochs_joint", 30))
 
@@ -673,6 +688,8 @@ def main():
             args.split_col,
             eval_scopes,
             return_details=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
         row = build_cumulative_result_row(
             len(cfg["sessions"]) - 1,
@@ -725,7 +742,7 @@ def main():
             )
 
             session_datasets = session.get("datasets", None)
-            loader = make_loader(args.data_csv, taxonomy, info["new_fine"], batch_size, True, split=train_split, split_col=args.split_col, dataset_filter=session_datasets)
+            loader = make_loader(args.data_csv, taxonomy, info["new_fine"], batch_size, True, split=train_split, split_col=args.split_col, dataset_filter=session_datasets, num_workers=num_workers, pin_memory=pin_memory)
             optimizer = scheduler = None
             prev_stage = None
 
@@ -748,6 +765,7 @@ def main():
                         model, loader, optimizer, device, epoch, session_idx, cfg,
                         replay_buffer=der_buffer,
                         lambda_fine=cfg["train"].get("lambda_cls_task", 1.0),
+                        use_amp=use_amp,
                     )
                 else:  # ours
                     train_session(
@@ -758,6 +776,7 @@ def main():
                         lambda_replay=cfg["train"].get("lambda_replay", 1.0),
                         train_cfg=cfg["train"],
                         cfg=cfg,
+                        use_amp=use_amp,
                     )
                 if scheduler is not None:
                     scheduler.step()
@@ -790,6 +809,8 @@ def main():
                 eval_scopes,
                 return_details=False,
                 dataset_filter=eval_dataset_filter,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
             )
             row = build_cumulative_result_row(session_idx, session.get("name", f"session_{session_idx}"), ckpt_path, metrics_by_scope, scope_mode)
             results.append(row)

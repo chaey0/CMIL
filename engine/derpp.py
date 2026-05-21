@@ -172,6 +172,7 @@ def train_session_derpp(
     replay_buffer: Optional[DERReplayBuffer] = None,
     lambda_fine: float = 1.0,
     debug_print_freq: int = 20,
+    use_amp: bool = False,
     **kwargs,
 ):
     """DER++ training loop for one epoch.
@@ -181,6 +182,9 @@ def train_session_derpp(
     model.train()
     train_cfg = cfg.get("train", {})
     stats = RunningStats()
+
+    use_amp = use_amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     alpha = float(train_cfg.get("derpp_alpha", 0.2))
     beta = float(train_cfg.get("derpp_beta", 0.2))
@@ -207,68 +211,70 @@ def train_session_derpp(
 
         optimizer.zero_grad(set_to_none=True)
 
-        z_shared, _ = model.encode_shared(feats)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            z_shared, _ = model.encode_shared(feats)
 
-        # --- current batch forward ---
-        out_global = _forward_global_from_z(model, z_shared, opened_task_keys, cfg)
-        global_logits = out_global["fine_logits"]
+            # --- current batch forward ---
+            out_global = _forward_global_from_z(model, z_shared, opened_task_keys, cfg)
+            global_logits = out_global["fine_logits"]
 
-        if _use_merged_organ_task_adaptors(model):
-            task_logits = _mask_logits_by_task_keys(
-                model, global_logits, task_keys, targets_local=fine_local,
+            if _use_merged_organ_task_adaptors(model):
+                task_logits = _mask_logits_by_task_keys(
+                    model, global_logits, task_keys, targets_local=fine_local,
+                )
+                out_task = dict(out_global)
+                out_task["fine_logits"] = task_logits
+            else:
+                out_task = _forward_task_from_z(model, z_shared, task_keys, cfg)
+                task_logits = out_task["fine_logits"]
+
+            loss_task = F.cross_entropy(task_logits, fine_local)
+            loss_global = (
+                F.cross_entropy(global_logits, fine_local)
+                if lam_global > 0 and len(opened_task_keys) > 1
+                else loss_task.new_tensor(0.0)
             )
-            out_task = dict(out_global)
-            out_task["fine_logits"] = task_logits
-        else:
-            out_task = _forward_task_from_z(model, z_shared, task_keys, cfg)
-            task_logits = out_task["fine_logits"]
 
-        loss_task = F.cross_entropy(task_logits, fine_local)
-        loss_global = (
-            F.cross_entropy(global_logits, fine_local)
-            if lam_global > 0 and len(opened_task_keys) > 1
-            else loss_task.new_tensor(0.0)
-        )
+            if lam_align > 0:
+                fine_bank = model.get_active_fine_bank(device)
+                loss_align = bank_contrastive_loss(
+                    out_task["h_f"], fine_bank, fine_local,
+                    tau=train_cfg.get("align_temperature", 0.07),
+                )
+            else:
+                loss_align = loss_task.new_tensor(0.0)
 
-        if lam_align > 0:
-            fine_bank = model.get_active_fine_bank(device)
-            loss_align = bank_contrastive_loss(
-                out_task["h_f"], fine_bank, fine_local,
-                tau=train_cfg.get("align_temperature", 0.07),
+            # --- replay ---
+            loss_replay_ce = loss_task.new_tensor(0.0)
+            loss_replay_mse = loss_task.new_tensor(0.0)
+
+            if replay_buffer is not None and len(replay_buffer) > 0 and session_idx > 0:
+                rep = replay_buffer.sample(batch_size=replay_batch_size)
+                if rep is not None:
+                    rep_feats = [f.to(device) for f in rep["feats_list"]]
+                    rep_fine_ids = rep["fine_ids"].to(device)
+                    rep_local = model.global_fine_to_local(rep_fine_ids)
+                    stored_logits = rep["stored_logits"].to(device)
+                    n_active = rep["n_active"].to(device)
+
+                    rep_z, _ = model.encode_shared(rep_feats)
+                    rep_out = _forward_global_from_z(model, rep_z, opened_task_keys, cfg)
+                    rep_logits = rep_out["fine_logits"]
+
+                    loss_replay_ce = F.cross_entropy(rep_logits, rep_local)
+                    loss_replay_mse = _dark_experience_loss(rep_logits, stored_logits, n_active)
+
+            loss = (
+                lam_task * loss_task
+                + lam_global * loss_global
+                + lam_align * loss_align
+                + alpha * loss_replay_ce
+                + beta * loss_replay_mse
             )
-        else:
-            loss_align = loss_task.new_tensor(0.0)
 
-        # --- replay ---
-        loss_replay_ce = loss_task.new_tensor(0.0)
-        loss_replay_mse = loss_task.new_tensor(0.0)
-
-        if replay_buffer is not None and len(replay_buffer) > 0 and session_idx > 0:
-            rep = replay_buffer.sample(batch_size=replay_batch_size)
-            if rep is not None:
-                rep_feats = [f.to(device) for f in rep["feats_list"]]
-                rep_fine_ids = rep["fine_ids"].to(device)
-                rep_local = model.global_fine_to_local(rep_fine_ids)
-                stored_logits = rep["stored_logits"].to(device)
-                n_active = rep["n_active"].to(device)
-
-                rep_z, _ = model.encode_shared(rep_feats)
-                rep_out = _forward_global_from_z(model, rep_z, opened_task_keys, cfg)
-                rep_logits = rep_out["fine_logits"]
-
-                loss_replay_ce = F.cross_entropy(rep_logits, rep_local)
-                loss_replay_mse = _dark_experience_loss(rep_logits, stored_logits, n_active)
-
-        loss = (
-            lam_task * loss_task
-            + lam_global * loss_global
-            + lam_align * loss_align
-            + alpha * loss_replay_ce
-            + beta * loss_replay_mse
-        )
-
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         task_acc = _masked_accuracy(task_logits, fine_local)
         global_acc = _masked_accuracy(global_logits, fine_local)

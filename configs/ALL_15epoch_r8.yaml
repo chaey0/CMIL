@@ -1,12 +1,12 @@
 model:
   embed_dim: 768
   mil_hidden_dim: 512
-  mil_dropout: 0.1
+  mil_dropout: 0.25
 
   use_mil_lora: true
-  mil_lora_r: 16
+  mil_lora_r: 8
   mil_lora_alpha: 16
-  mil_lora_dropout: 0.00
+  mil_lora_dropout: 0.05
 
   organ_task_adaptor_mode: "merge"
   organ_task_adaptor_merge: "sum"
@@ -60,9 +60,6 @@ eval:
 train:
   scheduler: "cosine"
   batch_size: 32
-  num_workers: 4
-  pin_memory: true
-  use_amp: true
 
   epochs_per_session: 15
   epochs_joint: 150

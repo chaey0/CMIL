@@ -751,9 +751,13 @@ def train_session(
     lambda_align=1.0,
     train_cfg=None,
     cfg=None,
+    use_amp=False,
 ):
     train_cfg = train_cfg or {}
     cfg = cfg or {"train": train_cfg, "hyperbolic": {}}
+
+    use_amp = use_amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     model.train()
     stats = RunningStats()
@@ -796,135 +800,134 @@ def train_session(
 
         optimizer.zero_grad(set_to_none=True)
 
-        z_shared, _ = model.encode_shared(feats)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            z_shared, _ = model.encode_shared(feats)
 
-        out_global = _forward_global_from_z(model, z_shared, opened_task_keys, cfg)
-        global_logits = out_global["fine_logits"]
-        task_logits = _mask_logits_by_task_keys(model, global_logits, task_keys, targets_local=fine_local)
+            out_global = _forward_global_from_z(model, z_shared, opened_task_keys, cfg)
+            global_logits = out_global["fine_logits"]
+            task_logits = _mask_logits_by_task_keys(model, global_logits, task_keys, targets_local=fine_local)
 
-        loss_task = F.cross_entropy(task_logits, fine_local)
-        if lam_global > 0 and len(opened_task_keys) > 1:
-            loss_global = F.cross_entropy(global_logits, fine_local)
-        else:
-            loss_global = loss_task.new_tensor(0.0)
-
-        if _use_merged_organ_task_adaptors(model):
-            out_task = dict(out_global)
-            out_task["fine_logits"] = task_logits
-        else:
-            out_task = _forward_task_from_z(model, z_shared, task_keys, cfg)
-
-        fine_bank = model.get_active_fine_bank(device)
-        fine_bank_tangent = _get_active_fine_bank_tangent(model, device, cfg)
-
-        if lam_align > 0:
-            if hyp_enabled:
-                loss_align = hyperbolic_bank_contrastive_loss(
-                    out_task["raw_h_f"], fine_bank_tangent, fine_local, cfg,
-                )
+            loss_task = F.cross_entropy(task_logits, fine_local)
+            if lam_global > 0 and len(opened_task_keys) > 1:
+                loss_global = F.cross_entropy(global_logits, fine_local)
             else:
-                loss_align = bank_contrastive_loss(
-                    out_task["h_f"], fine_bank, fine_local,
-                    tau=train_cfg.get("align_temperature", 0.07),
-                )
-        else:
-            loss_align = loss_task.new_tensor(0.0)
+                loss_global = loss_task.new_tensor(0.0)
 
-        if lam_sibling > 0:
-            if hyp_enabled:
-                loss_sib = hyperbolic_sibling_margin_loss(
-                    out_task["raw_h_f"], fine_bank_tangent, fine_local,
-                    parent_ids, cfg,
-                    margin=_get_hyp_cfg(cfg).get("sib_hyp_margin", 0.5),
-                )
+            if _use_merged_organ_task_adaptors(model):
+                out_task = dict(out_global)
+                out_task["fine_logits"] = task_logits
             else:
-                loss_sib = sibling_margin_loss(
-                    out_task["h_f"], fine_bank, fine_local, parent_ids,
-                    margin=train_cfg.get("sib_cos_margin", train_cfg.get("sibling_margin", 0.1)),
-                )
-        else:
-            loss_sib = loss_task.new_tensor(0.0)
+                out_task = _forward_task_from_z(model, z_shared, task_keys, cfg)
 
-        if lam_weight > 0:
-            loss_weight = classifier_weight_anchor_loss(model)
-        else:
-            loss_weight = loss_task.new_tensor(0.0)
+            fine_bank = model.get_active_fine_bank(device)
+            fine_bank_tangent = _get_active_fine_bank_tangent(model, device, cfg)
 
-        loss_replay = loss_task.new_tensor(0.0)
-        loss_replay_cls = loss_task.new_tensor(0.0)
-        loss_replay_align = loss_task.new_tensor(0.0)
-
-        if replay_buffer is not None and replay_buffer.stats and lam_replay > 0:
-            rep = replay_buffer.sample(
-                device,
-                num_per_class=train_cfg.get("replay_num_per_class", 4),
-            )
-            if rep is not None:
-                rep_local = model.global_fine_to_local(rep["fine_ids"])
-                rep_global = _forward_global_from_z(model, rep["z_shared"], opened_task_keys, cfg)
-                loss_replay_cls = F.cross_entropy(rep_global["fine_logits"], rep_local)
-
-                if _use_merged_organ_task_adaptors(model):
-                    rep_task_logits = _mask_logits_by_task_keys(
-                        model,
-                        rep_global["fine_logits"],
-                        rep["task_keys"],
-                        targets_local=rep_local,
+            if lam_align > 0:
+                if hyp_enabled:
+                    loss_align = hyperbolic_bank_contrastive_loss(
+                        out_task["raw_h_f"], fine_bank_tangent, fine_local, cfg,
                     )
-                    rep_task = dict(rep_global)
-                    rep_task["fine_logits"] = rep_task_logits
                 else:
-                    rep_task = _forward_task_from_z(model, rep["z_shared"], rep["task_keys"], cfg)
+                    loss_align = bank_contrastive_loss(
+                        out_task["h_f"], fine_bank, fine_local,
+                        tau=train_cfg.get("align_temperature", 0.07),
+                    )
+            else:
+                loss_align = loss_task.new_tensor(0.0)
 
-                replay_align_w = float(train_cfg.get("lambda_replay_align", 1.0))
+            if lam_sibling > 0:
+                if hyp_enabled:
+                    loss_sib = hyperbolic_sibling_margin_loss(
+                        out_task["raw_h_f"], fine_bank_tangent, fine_local,
+                        parent_ids, cfg,
+                        margin=_get_hyp_cfg(cfg).get("sib_hyp_margin", 0.5),
+                    )
+                else:
+                    loss_sib = sibling_margin_loss(
+                        out_task["h_f"], fine_bank, fine_local, parent_ids,
+                        margin=train_cfg.get("sib_cos_margin", train_cfg.get("sibling_margin", 0.1)),
+                    )
+            else:
+                loss_sib = loss_task.new_tensor(0.0)
 
-                if replay_align_w > 0:
-                    if hyp_enabled:
-                        loss_replay_align = hyperbolic_bank_contrastive_loss(
-                            rep_task["raw_h_f"], fine_bank_tangent, rep_local, cfg,
-                        )
-                    else:
-                        loss_replay_align = bank_contrastive_loss(
-                            rep_task["h_f"], fine_bank, rep_local,
-                            tau=train_cfg.get("align_temperature", 0.07),
-                        )
+            if lam_weight > 0:
+                loss_weight = classifier_weight_anchor_loss(model)
+            else:
+                loss_weight = loss_task.new_tensor(0.0)
 
-                loss_replay = (
-                    float(train_cfg.get("lambda_replay_cls", 1.0)) * loss_replay_cls
-                    + replay_align_w * loss_replay_align
+            loss_replay = loss_task.new_tensor(0.0)
+            loss_replay_cls = loss_task.new_tensor(0.0)
+            loss_replay_align = loss_task.new_tensor(0.0)
+
+            if replay_buffer is not None and replay_buffer.stats and lam_replay > 0:
+                rep = replay_buffer.sample(
+                    device,
+                    num_per_class=train_cfg.get("replay_num_per_class", 4),
                 )
+                if rep is not None:
+                    rep_local = model.global_fine_to_local(rep["fine_ids"])
+                    rep_global = _forward_global_from_z(model, rep["z_shared"], opened_task_keys, cfg)
+                    loss_replay_cls = F.cross_entropy(rep_global["fine_logits"], rep_local)
 
+                    if _use_merged_organ_task_adaptors(model):
+                        rep_task_logits = _mask_logits_by_task_keys(
+                            model,
+                            rep_global["fine_logits"],
+                            rep["task_keys"],
+                            targets_local=rep_local,
+                        )
+                        rep_task = dict(rep_global)
+                        rep_task["fine_logits"] = rep_task_logits
+                    else:
+                        rep_task = _forward_task_from_z(model, rep["z_shared"], rep["task_keys"], cfg)
 
-        if lam_orth > 0 and hasattr(model, "organ_task_adaptors"):
-            # Session 0 adaptor는 학습된 적 없음 (MIL full tuning).
-            # 무의미한 random subspace를 피하도록 제외.
-            base_key = opened_task_keys[0] if opened_task_keys else None
-            loss_orth = model.organ_task_adaptors.orthogonal_loss(
-                exclude_keys=[base_key] if base_key is not None else None,
+                    replay_align_w = float(train_cfg.get("lambda_replay_align", 1.0))
+
+                    if replay_align_w > 0:
+                        if hyp_enabled:
+                            loss_replay_align = hyperbolic_bank_contrastive_loss(
+                                rep_task["raw_h_f"], fine_bank_tangent, rep_local, cfg,
+                            )
+                        else:
+                            loss_replay_align = bank_contrastive_loss(
+                                rep_task["h_f"], fine_bank, rep_local,
+                                tau=train_cfg.get("align_temperature", 0.07),
+                            )
+
+                    loss_replay = (
+                        float(train_cfg.get("lambda_replay_cls", 1.0)) * loss_replay_cls
+                        + replay_align_w * loss_replay_align
+                    )
+
+            if lam_orth > 0 and hasattr(model, "organ_task_adaptors"):
+                base_key = opened_task_keys[0] if opened_task_keys else None
+                loss_orth = model.organ_task_adaptors.orthogonal_loss(
+                    exclude_keys=[base_key] if base_key is not None else None,
+                )
+            else:
+                loss_orth = loss_task.new_tensor(0.0)
+
+            if hierarchy_info is not None and lam_hierarchy > 0:
+                loss_hier = hyperbolic_hierarchy_loss(
+                    out_task["raw_h_f"], fine_local, hierarchy_info, _get_hyp_cfg(cfg),
+                )
+            else:
+                loss_hier = loss_task.new_tensor(0.0)
+
+            loss = (
+                lam_task * loss_task
+                + lam_global * loss_global
+                + lam_align * loss_align
+                + lam_sibling * loss_sib
+                + lam_weight * loss_weight
+                + lam_replay * loss_replay
+                + lam_orth * loss_orth
+                + lam_hierarchy * loss_hier
             )
-        else:
-            loss_orth = loss_task.new_tensor(0.0)
 
-        if hierarchy_info is not None and lam_hierarchy > 0:
-            loss_hier = hyperbolic_hierarchy_loss(
-                out_task["raw_h_f"], fine_local, hierarchy_info, _get_hyp_cfg(cfg),
-            )
-        else:
-            loss_hier = loss_task.new_tensor(0.0)
-
-        loss = (
-            lam_task * loss_task
-            + lam_global * loss_global
-            + lam_align * loss_align
-            + lam_sibling * loss_sib
-            + lam_weight * loss_weight
-            + lam_replay * loss_replay
-            + lam_orth * loss_orth
-            + lam_hierarchy * loss_hier
-        )
-
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         task_acc = _masked_accuracy(task_logits, fine_local)
         global_acc = _masked_accuracy(global_logits, fine_local)
